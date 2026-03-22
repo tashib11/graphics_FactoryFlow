@@ -1,0 +1,20 @@
+# Visual Studio
+.vs/
+*.ipch
+*.db
+*.suo
+
+# Build folders
+build/
+Debug/
+Release/
+x64/
+x86/
+
+# Executables
+*.exe
+*.out
+
+# Temp files
+*.log
+*.tmp
