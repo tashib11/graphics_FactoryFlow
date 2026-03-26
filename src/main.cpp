@@ -68,27 +68,58 @@ struct ConveyorLine {
 };
 std::vector<ConveyorLine> lines = {
     // Horizontal lines (along X axis) — LOWER level y=0.8
-    {{-40, 0.8f, -20}, {40, 0.8f, -20}, true},
-    {{-40, 0.8f, -10}, {40, 0.8f, -10}, true},
-    {{-40, 0.8f,   0}, {40, 0.8f,   0}, true},
-    {{-40, 0.8f,  10}, {40, 0.8f,  10}, true},
-    {{-40, 0.8f,  20}, {40, 0.8f,  20}, true},
+    {{-44, 0.8f, -20}, {44, 0.8f, -20}, true},
+    {{-44, 0.8f, -10}, {44, 0.8f, -10}, true},
+    {{-44, 0.8f,   0}, {44, 0.8f,   0}, true},
+    {{-44, 0.8f,  10}, {44, 0.8f,  10}, true},
+    {{-44, 0.8f,  20}, {44, 0.8f,  20}, true},
     // Vertical lines (along Z axis) — UPPER level y=3.0 to pass clearly OVER horizontal boxes
-    {{-20, 3.0f, -40}, {-20, 3.0f, 40}, false},
-    {{-10, 3.0f, -40}, {-10, 3.0f, 40}, false},
-    {{  0, 3.0f, -40}, {  0, 3.0f, 40}, false},
-    {{ 10, 3.0f, -40}, { 10, 3.0f, 40}, false},
-    {{ 20, 3.0f, -40}, { 20, 3.0f, 40}, false}
+    {{-20, 3.0f, -44}, {-20, 3.0f, 44}, false},
+    {{-10, 3.0f, -44}, {-10, 3.0f, 44}, false},
+    {{  0, 3.0f, -44}, {  0, 3.0f, 44}, false},
+    {{ 10, 3.0f, -44}, { 10, 3.0f, 44}, false},
+    {{ 20, 3.0f, -44}, { 20, 3.0f, 44}, false}
 };
 
 enum BoxStage { RAW = 0, PAINTED = 1, BOUND = 2 };
+enum BoxState { ON_BELT, WAITING_FOR_PICKUP, BEING_PICKED, ON_SHELF };
 
 struct GridBox {
     int lineIndex;
     float distance;
     BoxStage stage;
+    BoxState state        = ON_BELT;
+    glm::vec3 worldPos    = glm::vec3(0.0f); // used when off-belt
+    int shelfTier         = 0;
+    int shelfSlot         = 0;
+    float pickTimer       = 0.0f;
+    float onShelfT        = 0.0f;
 };
 std::vector<GridBox> gridBoxes;
+
+// Shelf placement tracking
+const int SHELF_TIERS = 5;
+const int SHELF_SLOTS = 8;
+bool shelfOccupied[10][SHELF_TIERS][SHELF_SLOTS] = {}; // 10 shelf towers (5 right, 5 front)
+glm::vec3 shelfTierPos[10][SHELF_TIERS][SHELF_SLOTS]; // world pos of each slot
+
+// Arm pick state machine
+struct ShelfArm {
+    glm::vec3 basePos;
+    float baseRotY;
+    float shoulderAngle  = -30.0f;
+    float targetAngle    = -30.0f;
+    int   pickBoxIndex   = -1;  // index into gridBoxes being carried
+    bool  carrying       = false;
+    float phase          = 0.0f; // 0=idle/reaching, 1=lifted, 2=placing
+    float phaseTimer     = 0.0f;
+    bool  armBusy        = false;
+    glm::vec3 pickupPos;
+    glm::vec3 placePos;
+    int towerIndex;
+    glm::vec3 effectorPos = glm::vec3(0.0f);
+};
+ShelfArm shelfArms[10];
 
 // Basic custom perspective
 glm::mat4 customPerspective(float fovRadians, float aspect, float zNear, float zFar) {
@@ -144,44 +175,79 @@ void drawBindingArm(Shader &shader, glm::vec3 basePos, float baseRotY, unsigned 
     glDrawArrays(GL_TRIANGLES, 0, 36);
 }
 
-// Shelf arm: reaches upward to place boxes. shoulderAngle animates up/down.
-void drawShelfArm(Shader &shader, glm::vec3 basePos, float baseRotY, float shoulderAngle, unsigned int darkTex, unsigned int lightTex) {
+// Shelf arm: Industrial Stacker Crane
+void drawShelfArm(Shader &shader, glm::vec3 basePos, glm::vec3 effectorPos, unsigned int darkTex, unsigned int lightTex) {
+    // 1. Fixed tall Mast (from Y=0 up to Y=18)
     glBindTexture(GL_TEXTURE_2D, darkTex);
-    glm::mat4 base = glm::translate(glm::mat4(1.0f), basePos);
-    base = glm::rotate(base, glm::radians(baseRotY), glm::vec3(0,1,0));
-    shader.setMat4("model", glm::scale(base, glm::vec3(2.0f, 0.6f, 2.0f)));
+    glm::mat4 mast = glm::translate(glm::mat4(1.0f), glm::vec3(basePos.x, 9.0f, basePos.z));
+    shader.setMat4("model", glm::scale(mast, glm::vec3(1.0f, 18.0f, 1.0f)));
     glDrawArrays(GL_TRIANGLES, 0, 36);
+
+    // 2. Carriage (slides up/down the mast to match effectorPos.y)
+    float boomY = effectorPos.y + 1.2f;
 
     glBindTexture(GL_TEXTURE_2D, lightTex);
-    glm::mat4 turret = glm::translate(base, glm::vec3(0.0f, 0.6f, 0.0f));
-    shader.setMat4("model", glm::scale(turret, glm::vec3(1.2f, 0.8f, 1.2f)));
+    glm::mat4 carriage = glm::translate(glm::mat4(1.0f), glm::vec3(basePos.x, boomY, basePos.z));
+    shader.setMat4("model", glm::scale(carriage, glm::vec3(1.5f, 1.5f, 1.5f)));
     glDrawArrays(GL_TRIANGLES, 0, 36);
 
+    // 3. Boom (horizontal beam connecting mast to effector position)
+    glm::vec2 boomStart(basePos.x, basePos.z);
+    glm::vec2 boomEnd(effectorPos.x, effectorPos.z);
+    glm::vec2 boomDir = boomEnd - boomStart;
+    float boomLen = glm::length(boomDir);
+    
+    if (boomLen > 0.05f) {
+        glm::vec2 dirNorm = boomDir / boomLen;
+        float angleY = atan2(dirNorm.x, dirNorm.y);
+        
+        // Boom spans from carriage to the effector directly
+        glm::vec3 boomCenter = glm::vec3(basePos.x + boomDir.x*0.5f, boomY, basePos.z + boomDir.y*0.5f);
+        
+        glBindTexture(GL_TEXTURE_2D, darkTex);
+        glm::mat4 boom = glm::translate(glm::mat4(1.0f), boomCenter);
+        boom = glm::rotate(boom, angleY, glm::vec3(0,1,0));
+        shader.setMat4("model", glm::scale(boom, glm::vec3(0.5f, 0.5f, boomLen)));
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+        
+        // 4. Gripper Head (at the end of the boom, hovering above the box)
+        glBindTexture(GL_TEXTURE_2D, lightTex);
+        glm::mat4 head = glm::translate(glm::mat4(1.0f), glm::vec3(effectorPos.x, boomY, effectorPos.z));
+        shader.setMat4("model", glm::scale(head, glm::vec3(1.0f, 0.6f, 1.0f)));
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+        
+        // Gripper Claws mapping down to the box
+        glBindTexture(GL_TEXTURE_2D, darkTex);
+        for(float lx : {-0.4f, 0.4f}) {
+            glm::mat4 claw = glm::translate(glm::mat4(1.0f), glm::vec3(effectorPos.x + lx*dirNorm.y, boomY - 0.6f, effectorPos.z - lx*dirNorm.x));
+            shader.setMat4("model", glm::scale(claw, glm::vec3(0.1f, 1.2f, 0.8f))); // approximate bounding bracket
+            glDrawArrays(GL_TRIANGLES, 0, 36);
+        }
+    }
+}
+
+// Industrial Black Box Paint Chamber
+void drawPaintChamber(Shader &shader, glm::vec3 pos, bool isHorizontal, unsigned int darkTex, unsigned int glowTex, unsigned int pipeTex) {
     glBindTexture(GL_TEXTURE_2D, darkTex);
-    glm::mat4 shoulderOrigin = glm::translate(turret, glm::vec3(0.0f, 0.8f, 0.0f));
-    shoulderOrigin = glm::rotate(shoulderOrigin, glm::radians(shoulderAngle), glm::vec3(1,0,0));
-    glm::mat4 upperArm = glm::translate(shoulderOrigin, glm::vec3(0.0f, 1.5f, 0.0f));
-    shader.setMat4("model", glm::scale(upperArm, glm::vec3(0.7f, 3.0f, 0.7f)));
+    glm::mat4 model = glm::translate(glm::mat4(1.0f), pos + glm::vec3(0.0f, 1.6f, 0.0f)); 
+    glm::vec3 shellScale = isHorizontal ? glm::vec3(6.0f, 4.0f, 5.0f) : glm::vec3(5.0f, 4.0f, 6.0f);
+    shader.setMat4("model", glm::scale(model, shellScale));
     glDrawArrays(GL_TRIANGLES, 0, 36);
 
-    glBindTexture(GL_TEXTURE_2D, lightTex);
-    glm::mat4 elbow = glm::translate(shoulderOrigin, glm::vec3(0.0f, 3.0f, 0.0f));
-    shader.setMat4("model", glm::scale(elbow, glm::vec3(1.0f, 0.5f, 1.0f)));
+    glBindTexture(GL_TEXTURE_2D, glowTex);
+    glm::mat4 glow = glm::translate(glm::mat4(1.0f), pos + glm::vec3(0.0f, 0.2f, 0.0f));
+    glm::vec3 glowScale = isHorizontal ? glm::vec3(5.8f, 0.4f, 3.0f) : glm::vec3(3.0f, 0.4f, 5.8f);
+    shader.setMat4("model", glm::scale(glow, glowScale));
     glDrawArrays(GL_TRIANGLES, 0, 36);
 
-    // Forearm angles down
-    glBindTexture(GL_TEXTURE_2D, darkTex);
-    glm::mat4 foreArm = glm::translate(elbow, glm::vec3(0.0f, 0.5f, 0.0f));
-    foreArm = glm::rotate(foreArm, glm::radians(-shoulderAngle*0.5f), glm::vec3(1,0,0));
-    glm::mat4 foreArmDraw = glm::translate(foreArm, glm::vec3(0.0f, 1.0f, 0.0f));
-    shader.setMat4("model", glm::scale(foreArmDraw, glm::vec3(0.5f, 2.0f, 0.5f)));
-    glDrawArrays(GL_TRIANGLES, 0, 36);
-
-    // Simple gripper at end
-    glBindTexture(GL_TEXTURE_2D, lightTex);
-    glm::mat4 grip = glm::translate(foreArm, glm::vec3(0.0f, 2.1f, 0.0f));
-    shader.setMat4("model", glm::scale(grip, glm::vec3(0.9f, 0.2f, 0.9f)));
-    glDrawArrays(GL_TRIANGLES, 0, 36);
+    glBindTexture(GL_TEXTURE_2D, pipeTex);
+    for(float offset : {-1.5f, 1.5f}) {
+        glm::vec3 pPos = pos + glm::vec3(0.0f, 4.8f, 0.0f);
+        if (isHorizontal) pPos.z += offset; else pPos.x += offset;
+        glm::mat4 pModel = glm::translate(glm::mat4(1.0f), pPos);
+        shader.setMat4("model", glm::scale(pModel, glm::vec3(0.6f, 2.8f, 0.6f)));
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+    }
 }
 
 void framebuffer_size_callback(GLFWwindow* window, int width, int height);
@@ -297,8 +363,48 @@ int main()
         int numBoxes = (int)(len / 4.0f); // Space them exactly per line length
         float spacing = len / (float)numBoxes;
         for(int b=0; b<numBoxes; b++) {
-            gridBoxes.push_back({i, b * spacing, RAW});
+            float dist = b * spacing;
+            BoxStage stage = RAW;
+            if (dist > len*0.5f) {
+                stage = (i == 2) ? BOUND : PAINTED;
+            }
+            gridBoxes.push_back({i, dist, stage});
         }
+    }
+
+    // Pre-compute shelf slot positions for the 10 destination shelves
+    // 5 right shelves (X=46) for horizontal belts
+    for(int tower=0; tower<5; tower++) {
+        float shelfZ = -20.0f + tower * 10.0f;
+        for(int tier=0; tier<SHELF_TIERS; tier++) {
+            for(int slot=0; slot<SHELF_SLOTS; slot++) {
+                float bz = -3.5f + slot * 1.0f; // spread across shelf depth
+                shelfTierPos[tower][tier][slot] = glm::vec3(46.0f, tier * 3.0f + 0.6f + 0.5f, shelfZ + bz);
+            }
+        }
+    }
+    // 5 front shelves (Z=46) for vertical belts
+    for(int tower=0; tower<5; tower++) {
+        float shelfX = -20.0f + tower * 10.0f;
+        for(int tier=0; tier<SHELF_TIERS; tier++) {
+            for(int slot=0; slot<SHELF_SLOTS; slot++) {
+                float bx = -3.5f + slot * 1.0f; // spread across shelf width
+                shelfTierPos[5+tower][tier][slot] = glm::vec3(shelfX + bx, tier * 3.0f + 0.6f + 0.5f, 46.0f);
+            }
+        }
+    }
+
+    // Initialize the 10 shelf arms
+    for(int i=0; i<5; i++) {
+        float z = -20.0f + i * 10.0f;
+        shelfArms[i].basePos   = glm::vec3(38.0f, 0.0f, z + 2.5f); // Right side arms
+        shelfArms[i].baseRotY  = -90.0f; // Face left towards belt
+        shelfArms[i].towerIndex = i;
+        
+        float x = -20.0f + i * 10.0f;
+        shelfArms[5+i].basePos   = glm::vec3(x + 2.5f, 0.0f, 38.0f); // Front side arms
+        shelfArms[5+i].baseRotY  = 180.0f; // Face back towards belt
+        shelfArms[5+i].towerIndex = 5+i;
     }
 
     while (!glfwWindowShouldClose(window))
@@ -317,43 +423,193 @@ int main()
         gripperSpread = 0.4f + 0.35f * sin(glfwGetTime() * 2.5f); // oscillates 0.05..0.75
 
         // --- BOX PROCESSING STAGE MACHINE ---
-        // Paint chamber on line 7 (upper vertical, X=0, Z from -40 to 40)
-        // distance 40 = center of 80-unit line = Z=0
-        float paintZoneCenter = 40.0f;
-        float paintRadius = 5.0f;
-        // Robot binding arms on line 2 (lower horizontal, Z=0, X from -40 to 40)
-        // 3 arms at X=-10, X=5, X=20 => distances 30, 45, 60 on that line
-        float bindPositions[3] = {30.0f, 45.0f, 60.0f};
-        float bindRadius = 4.0f;
-        for(auto &b : gridBoxes) {
-            if(b.lineIndex == 7) { // upper vertical belt at X=0
-                if(b.distance >= paintZoneCenter - paintRadius &&
-                   b.distance <= paintZoneCenter + paintRadius) {
+        float bindPositions[3] = {30.0f, 45.0f, 60.0f}; // X = -10, 5, 20 on Z=0 belt
+        float bindRadius      = 4.0f;
+        float conveyorSpeed   = 1.5f;
+
+        // ----- BOX STATE MACHINE -----
+        std::vector<GridBox> newBoxes;
+
+        for (int i = 0; i < (int)gridBoxes.size(); i++) {
+            GridBox &b = gridBoxes[i];
+
+            if (b.state == ON_BELT) {
+                float lineLen = glm::length(lines[b.lineIndex].end - lines[b.lineIndex].start);
+                
+                // Unified paint zone perfectly matching the central Paint Chamber!
+                // Box turns blue identically at the exact halfway point, hidden under the machine shell.
+                if (b.distance >= lineLen * 0.5f && b.stage == RAW) {
                     b.stage = PAINTED;
                 }
-                if(b.distance < 2.0f) b.stage = RAW;
-            }
-            if(b.lineIndex == 2) { // lower horizontal belt at Z=0
-                for(int arm=0; arm<3; arm++) {
-                    if(b.distance >= bindPositions[arm] - bindRadius &&
-                       b.distance <= bindPositions[arm] + bindRadius) {
-                        b.stage = BOUND;
+
+                // Horizontal belt line 2 (Z=0) has the binding stations along its path
+                if (b.lineIndex == 2) {
+                    for (int arm = 0; arm < 3; arm++) {
+                        if (b.distance >= bindPositions[arm] - bindRadius &&
+                            b.distance <= bindPositions[arm] + bindRadius)
+                            b.stage = BOUND;
                     }
                 }
-                if(b.distance < 2.0f) b.stage = RAW;
+
+                // --- Move along belt ---
+                b.distance += conveyorSpeed * deltaTime;
+                float exitDist = lineLen - 1.5f; // End of belt near shelf
+
+                if (b.distance >= exitDist) {
+                    if (b.stage == PAINTED || b.stage == BOUND) {
+                        // COLORED box: wait at the end of the belt for robotic arm
+                        glm::vec3 dir   = glm::normalize(lines[b.lineIndex].end - lines[b.lineIndex].start);
+                        b.worldPos      = lines[b.lineIndex].start + dir * exitDist;
+                        b.worldPos.y    = lines[b.lineIndex].start.y + 0.6f;
+                        b.state         = WAITING_FOR_PICKUP;
+                        // Spawn replacement box just inside start shelf so it rolls out smoothly
+                        GridBox nb;
+                        nb.lineIndex = b.lineIndex;
+                        nb.distance  = -4.0f; 
+                        nb.stage     = RAW;
+                        nb.state     = ON_BELT;
+                        newBoxes.push_back(nb);
+                    } else {
+                        // RAW box never got colored - loops back to start
+                        b.distance -= lineLen;
+                        b.stage = RAW;
+                    }
+                }
+
+            } else if (b.state == WAITING_FOR_PICKUP) {
+                // Box sits quietly at the end of the horizontal belt
+                // Robotic arm logic will find it and change state to BEING_PICKED
+                
+            } else if (b.state == BEING_PICKED) {
+                // Picked by arm. Just safety timeout:
+                b.pickTimer += deltaTime;
+                if (b.pickTimer > 8.0f) {
+                    int tIdx = b.lineIndex;
+                    bool placed = false;
+                    for (int t = 0; t < SHELF_TIERS && !placed; t++) {
+                        for (int s = 0; s < SHELF_SLOTS && !placed; s++) {
+                            if (!shelfOccupied[tIdx][t][s]) {
+                                shelfOccupied[tIdx][t][s] = true;
+                                b.worldPos  = shelfTierPos[tIdx][t][s];
+                                b.stage     = BOUND;
+                                b.state     = ON_SHELF;
+                                placed      = true;
+                            }
+                        }
+                    }
+                    if (!placed) b.state = ON_SHELF;
+                }
+
+            } else if (b.state == ON_SHELF) {
+                b.onShelfT += deltaTime;
             }
         }
-        // Animate arm reach (oscillate toward the belt and back)
+
+        // Add newly spawned replacement boxes
+        for (auto &nb : newBoxes)
+            gridBoxes.push_back(nb);
+
+        // Arm reach (binding arm oscillation)
         armReachAngle = -30.0f + sin(glfwGetTime() * 3.0f) * 28.0f;
-        
-        // Box animation along rectilinear grid
-        float speed = 1.5f; // Slower, realistic conveyor speed
-        for (int i = 0; i < gridBoxes.size(); i++) {
-            gridBoxes[i].distance += speed * deltaTime;
-            float lineLen = glm::length(lines[gridBoxes[i].lineIndex].end - lines[gridBoxes[i].lineIndex].start);
-            if (gridBoxes[i].distance >= lineLen) {
-                gridBoxes[i].distance -= lineLen; // Perfect seamless wrapping math
+
+        // ----- SHELF ARM AI -----
+        for (int a = 0; a < 10; a++) {
+            ShelfArm &arm = shelfArms[a];
+
+            if (!arm.armBusy) {
+                // Look for a box waiting at the end of THIS arm's belt
+                int closest = -1;
+                for (int i = 0; i < (int)gridBoxes.size(); i++) {
+                    if (gridBoxes[i].state == WAITING_FOR_PICKUP && gridBoxes[i].lineIndex == arm.towerIndex) {
+                        closest = i;
+                        break;
+                    }
+                }
+                if (closest >= 0) {
+                    // Find a free shelf slot on this tower
+                    for (int t = 0; t < SHELF_TIERS; t++) {
+                        for (int s = 0; s < SHELF_SLOTS; s++) {
+                            if (!shelfOccupied[arm.towerIndex][t][s]) {
+                                shelfOccupied[arm.towerIndex][t][s] = true;
+                                arm.pickBoxIndex = closest;
+                                arm.pickupPos    = gridBoxes[closest].worldPos;
+                                arm.placePos     = shelfTierPos[arm.towerIndex][t][s];
+                                gridBoxes[closest].state = BEING_PICKED;
+                                gridBoxes[closest].pickTimer = 0.0f;
+                                arm.armBusy   = true;
+                                arm.phase     = 0.0f;
+                                arm.phaseTimer = 0.0f;
+                                arm.carrying  = false;
+                                // Reset idle position precisely
+                                arm.effectorPos = arm.basePos + glm::vec3(0, 10.0f, 0); 
+                                goto nextArm;
+                            }
+                        }
+                    }
+                }
+            } else {
+                arm.phaseTimer += deltaTime;
+                glm::vec3 idlePos = arm.basePos + glm::vec3(0, 10.0f, 0);
+
+                if (arm.phase == 0.0f) {
+                    // Fast reach DOWN toward pickup (0.4s)
+                    float t = glm::clamp(arm.phaseTimer / 0.4f, 0.0f, 1.0f);
+                    t = t * t * (3.0f - 2.0f * t); // smoothstep
+                    arm.effectorPos = glm::mix(idlePos, arm.pickupPos, t);
+
+                    if (arm.phaseTimer >= 0.4f) { 
+                        arm.phase = 1.0f; 
+                        arm.phaseTimer = 0.0f;
+                        arm.carrying = true; // Box grabbed!
+                    }
+                } else if (arm.phase == 1.0f) {
+                    // Fast Lift UP with the box (0.3s)
+                    float t = glm::clamp(arm.phaseTimer / 0.3f, 0.0f, 1.0f);
+                    t = t * t * (3.0f - 2.0f * t);
+                    glm::vec3 liftPos = arm.pickupPos + glm::vec3(0, 4.0f, 0);
+                    arm.effectorPos = glm::mix(arm.pickupPos, liftPos, t);
+
+                    if (arm.phaseTimer >= 0.3f) { arm.phase = 2.0f; arm.phaseTimer = 0.0f; }
+                } else if (arm.phase == 2.0f) {
+                    // Fast swing toward shelf & lower (0.6s)
+                    float t = glm::clamp(arm.phaseTimer / 0.6f, 0.0f, 1.0f);
+                    t = t * t * (3.0f - 2.0f * t);
+                    
+                    glm::vec3 liftPos = arm.pickupPos + glm::vec3(0, 4.0f, 0);
+                    glm::vec3 dropPos = arm.placePos  + glm::vec3(0, 4.0f, 0);
+                    
+                    if (t < 0.7f) {
+                        arm.effectorPos = glm::mix(liftPos, dropPos, t / 0.7f);
+                    } else {
+                        arm.effectorPos = glm::mix(dropPos, arm.placePos, (t - 0.7f) / 0.3f);
+                    }
+
+                    if (arm.phaseTimer >= 0.6f) {
+                        // Place box!
+                        if (arm.pickBoxIndex >= 0 && arm.pickBoxIndex < (int)gridBoxes.size()) {
+                            gridBoxes[arm.pickBoxIndex].worldPos = arm.placePos;
+                            gridBoxes[arm.pickBoxIndex].state    = ON_SHELF;
+                            gridBoxes[arm.pickBoxIndex].stage    = BOUND;
+                        }
+                        arm.armBusy    = false;
+                        arm.carrying   = false;
+                        arm.pickBoxIndex = -1;
+                        arm.phase      = 0.0f;
+                        arm.phaseTimer = 0.0f;
+                    }
+                }
+
+                // MATHEMATICAL GLUE: Box perfectly tracks the crane effector
+                if (arm.carrying && arm.pickBoxIndex >= 0 && arm.pickBoxIndex < (int)gridBoxes.size()) {
+                    gridBoxes[arm.pickBoxIndex].worldPos = arm.effectorPos;
+                }
             }
+            
+            // Auto return to idle when not busy
+            if (!arm.armBusy) {
+                arm.effectorPos = glm::mix(arm.effectorPos, arm.basePos + glm::vec3(0, 10.0f, 0), deltaTime * 2.0f);
+            }
+            nextArm:;
         }
 
         glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
@@ -499,6 +755,15 @@ void renderScene(Shader &shader, unsigned int VAO, unsigned int boxTex, unsigned
         shader.setMat4("model", trackModel);
         glDrawArrays(GL_TRIANGLES, 0, 36);
 
+        // Rounded roller "drums" at start and end of track
+        glBindTexture(GL_TEXTURE_2D, wallTex);
+        glm::mat4 drumStart = glm::translate(model, glm::vec3(0.0f, -0.05f, -len/2.0f));
+        shader.setMat4("model", glm::scale(drumStart, glm::vec3(2.7f, 0.5f, 0.5f)));
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+        glm::mat4 drumEnd = glm::translate(model, glm::vec3(0.0f, -0.05f, len/2.0f));
+        shader.setMat4("model", glm::scale(drumEnd, glm::vec3(2.7f, 0.5f, 0.5f)));
+        glDrawArrays(GL_TRIANGLES, 0, 36);
+
         // Glowing Blue Guide Rails
         glBindTexture(GL_TEXTURE_2D, blueTex);
         glm::mat4 rail1 = glm::translate(model, glm::vec3(-1.45f, 0.15f, 0.0f));
@@ -528,13 +793,22 @@ void renderScene(Shader &shader, unsigned int VAO, unsigned int boxTex, unsigned
 
     // 2. DRAW MASSIVE BOX POPULATION (Animated)
     for(size_t i=0; i<gridBoxes.size(); i++) {
-        glm::vec3 dir = glm::normalize(lines[gridBoxes[i].lineIndex].end - lines[gridBoxes[i].lineIndex].start);
-        glm::vec3 pos = lines[gridBoxes[i].lineIndex].start + dir * gridBoxes[i].distance;
-        pos.y = lines[gridBoxes[i].lineIndex].start.y + 0.6f;
-        float angle = atan2(dir.x, dir.z);
+        const GridBox &gb = gridBoxes[i];
+        glm::vec3 pos;
+        float angle = 0.0f;
+
+        if (gb.state == ON_BELT) {
+            glm::vec3 dir = glm::normalize(lines[gb.lineIndex].end - lines[gb.lineIndex].start);
+            pos = lines[gb.lineIndex].start + dir * gb.distance;
+            pos.y = lines[gb.lineIndex].start.y + 0.6f;
+            angle = atan2(dir.x, dir.z);
+        } else {
+            // Off-belt states: use worldPos
+            pos = gb.worldPos;
+        }
 
         // Choose color/texture by stage
-        if(gridBoxes[i].stage == PAINTED || gridBoxes[i].stage == BOUND) {
+        if(gb.stage == PAINTED || gb.stage == BOUND) {
             glBindTexture(GL_TEXTURE_2D, blueTex);
         } else {
             glBindTexture(GL_TEXTURE_2D, boxTex);
@@ -546,9 +820,9 @@ void renderScene(Shader &shader, unsigned int VAO, unsigned int boxTex, unsigned
         shader.setMat4("model", model);
         glDrawArrays(GL_TRIANGLES, 0, 36);
 
-        // If BOUND: draw 3 thin hemp-coloured rope bands over the box
-        if(gridBoxes[i].stage == BOUND) {
-            glBindTexture(GL_TEXTURE_2D, wallTex); // tan/grey band colour
+        // If BOUND: draw rope bands over the box
+        if(gb.stage == BOUND) {
+            glBindTexture(GL_TEXTURE_2D, wallTex);
             float offsets[3] = {-0.3f, 0.0f, 0.3f};
             for(int r=0; r<3; r++) {
                 glm::mat4 rope = glm::translate(glm::mat4(1.0f), pos + glm::vec3(0.0f, offsets[r], 0.0f));
@@ -560,91 +834,74 @@ void renderScene(Shader &shader, unsigned int VAO, unsigned int boxTex, unsigned
         }
     }
 
-    // 3. DRAW MASSIVE SHELVING — Left Half = FRESH boxes | Right Half = BOUND (blue) boxes
-    glBindTexture(GL_TEXTURE_2D, conveyorTex); // Dark racking iron
-    for(int s=0; s<4; s++) {
-        float shelfX = -45.0f + s * 30.0f;
-        float shelfZ = -45.0f;
-        bool isBoundSide = (s >= 2); // right 2 towers hold finished bound boxes
+    // 3. DRAW MASSIVE SHELVING — Left/Right Walls & Back/Front Walls
+    for(int wall=0; wall<4; wall++) {
+        // wall 0: Left (X=-46), wall 1: Right (X=46)
+        // wall 2: Back (Z=-46), wall 3: Front (Z=46)
+        bool isBoundSide = (wall == 1 || wall == 3);
+        float mainCoord = (wall == 0 || wall == 2) ? -46.0f : 46.0f;
+        bool isHorizontal = (wall < 2);
+        
+        for(int tower=0; tower<5; tower++) {
+            float crossOffset = -20.0f + tower * 10.0f;
+            float shelfX = isHorizontal ? mainCoord : crossOffset;
+            float shelfZ = isHorizontal ? crossOffset : mainCoord;
 
-        // Horizontal shelf tiers
-        for(int y=0; y<5; y++) {
-            glBindTexture(GL_TEXTURE_2D, conveyorTex);
-            glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(shelfX, y*3.0f, shelfZ));
-            model = glm::scale(model, glm::vec3(26.0f, 0.2f, 4.0f));
-            shader.setMat4("model", model);
-            glDrawArrays(GL_TRIANGLES, 0, 36);
+            // Horizontal shelf tiers
+            for(int y=0; y<5; y++) {
+                glBindTexture(GL_TEXTURE_2D, conveyorTex);
+                glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(shelfX, y*3.0f, shelfZ));
+                model = glm::scale(model, isHorizontal ? glm::vec3(4.0f, 0.2f, 9.0f) : glm::vec3(9.0f, 0.2f, 4.0f));
+                shader.setMat4("model", model);
+                glDrawArrays(GL_TRIANGLES, 0, 36);
 
-            // Boxes on shelf: fresh-brown on left, blue-bound on right
-            for(float bx = -12.0f; bx <= 12.0f; bx += 1.5f) {
-                if((int)(bx*shelfX+y) % 5 == 0) continue; // natural gaps
+                // Aesthetic static boxes to make shelves look full initially
+                for(float b_cross = -3.5f; b_cross <= 3.5f; b_cross += 1.5f) {
+                    if((int)(b_cross*10.0f + y + tower) % 4 == 0) continue; // natural gaps
 
-                if(isBoundSide) {
-                    // Blue painted + bound box
-                    glBindTexture(GL_TEXTURE_2D, blueTex);
-                    glm::mat4 bModel = glm::translate(glm::mat4(1.0f), glm::vec3(shelfX+bx, y*3.0f+0.6f, shelfZ));
-                    shader.setMat4("model", glm::scale(bModel, glm::vec3(1.0f, 1.0f, 1.2f)));
-                    glDrawArrays(GL_TRIANGLES, 0, 36);
-                    // Rope bands
-                    glBindTexture(GL_TEXTURE_2D, wallTex);
-                    for(float ro : {-0.25f, 0.0f, 0.25f}) {
-                        glm::mat4 rModel = glm::translate(glm::mat4(1.0f), glm::vec3(shelfX+bx, y*3.0f+0.6f+ro, shelfZ));
-                        shader.setMat4("model", glm::scale(rModel, glm::vec3(1.05f, 0.1f, 1.25f)));
+                    // Only draw static boxes on the RAW sides
+                    if(!isBoundSide) {
+                        glBindTexture(GL_TEXTURE_2D, boxTex);
+                        float bx = isHorizontal ? 0.0f : b_cross;
+                        float bz = isHorizontal ? b_cross : 0.0f;
+                        glm::mat4 bModel = glm::translate(glm::mat4(1.0f), glm::vec3(shelfX+bx, y*3.0f+0.6f, shelfZ+bz));
+                        shader.setMat4("model", glm::scale(bModel, glm::vec3(1.2f, 1.0f, 1.0f)));
                         glDrawArrays(GL_TRIANGLES, 0, 36);
                     }
-                } else {
-                    // Fresh cardboard brown boxes
-                    glBindTexture(GL_TEXTURE_2D, boxTex);
-                    glm::mat4 bModel = glm::translate(glm::mat4(1.0f), glm::vec3(shelfX+bx, y*3.0f+0.6f, shelfZ));
-                    shader.setMat4("model", glm::scale(bModel, glm::vec3(1.0f, 1.0f, 1.2f)));
+                }
+            }
+
+            // Vertical posts for the tower
+            glBindTexture(GL_TEXTURE_2D, conveyorTex);
+            float p_main = 1.8f, p_cross = 4.3f;
+            float pxArr[2] = { isHorizontal ? -p_main : -p_cross, isHorizontal ? p_main : p_cross };
+            float pzArr[2] = { isHorizontal ? -p_cross : -p_main, isHorizontal ? p_cross : p_main };
+            
+            for(int p_i=0; p_i<2; p_i++) {
+                for(int p_j=0; p_j<2; p_j++) {
+                    glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(shelfX+pxArr[p_i], 6.0f, shelfZ+pzArr[p_j]));
+                    model = glm::scale(model, glm::vec3(0.4f, 12.0f, 0.4f));
+                    shader.setMat4("model", model);
                     glDrawArrays(GL_TRIANGLES, 0, 36);
                 }
             }
         }
-
-        // Vertical posts
-        glBindTexture(GL_TEXTURE_2D, conveyorTex);
-        for(float vx = -13.0f; vx <= 13.0f; vx += 13.0f) {
-            glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(shelfX+vx, 6.0f, shelfZ));
-            model = glm::scale(model, glm::vec3(0.5f, 12.0f, 4.0f));
-            shader.setMat4("model", model);
-            glDrawArrays(GL_TRIANGLES, 0, 36);
-        }
     }
 
-    // 3.5 PAINT CHAMBER — on UPPER BELT (line 7 = vertical, X=0, positioned at Z=0)
-    {
-        // Main chamber shell (dark metallic industrial block) — stands OVER the upper belt
-        glBindTexture(GL_TEXTURE_2D, conveyorTex);
-        glm::mat4 model = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 4.6f, 0.0f)); // centred at Z=0
-        model = glm::scale(model, glm::vec3(5.0f, 4.0f, 6.0f)); // spans the track width
-        shader.setMat4("model", model); glDrawArrays(GL_TRIANGLES, 0, 36);
-
-        // Entry/Exit arch openings (bright blue glowing slits)
-        glBindTexture(GL_TEXTURE_2D, blueTex);
-        model = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f, 3.2f, 0.0f));
-        model = glm::scale(model, glm::vec3(3.0f, 0.4f, 5.8f));
-        shader.setMat4("model", model); glDrawArrays(GL_TRIANGLES, 0, 36);
-
-        // Two top exhaust chimney pipes
-        glBindTexture(GL_TEXTURE_2D, wallTex);
-        for(float px : {-1.0f, 1.0f}) {
-            model = glm::translate(glm::mat4(1.0f), glm::vec3(px, 7.8f, 0.0f));
-            model = glm::scale(model, glm::vec3(0.5f, 2.5f, 0.5f));
-            shader.setMat4("model", model); glDrawArrays(GL_TRIANGLES, 0, 36);
-        }
+    // 3.5 PAINT CHAMBERS — on EVERY BELT
+    for(size_t i=0; i<lines.size(); i++) {
+        glm::vec3 midPoint = (lines[i].start + lines[i].end) * 0.5f;
+        drawPaintChamber(shader, midPoint, lines[i].isHorizontal, conveyorTex, blueTex, wallTex);
     }
 
     // 4a. BINDING ARM — 1 arm beside lower belt at Z=0 (near binding zone at X=-10)
     //     Body FIXED, only gripper opens/closes around the passing box
     drawBindingArm(shader, glm::vec3(-10.0f, 0.0f, 3.0f), 180.0f, conveyorTex, wallTex, gripperSpread);
 
-    // 4b. SHELF PLACEMENT ARMS — 2 arms at the back shelves
-    //     Left shelf arm (serves fresh cardboard boxes on left shelf towers)
-    float shelfArmAngle = -30.0f + sin(glfwGetTime() * 1.5f) * 35.0f;
-    drawShelfArm(shader, glm::vec3(-45.0f, 0.0f, -38.0f),  90.0f, shelfArmAngle, conveyorTex, wallTex);
-    //     Right shelf arm (places bound blue boxes on right shelf towers)
-    drawShelfArm(shader, glm::vec3( 50.0f, 0.0f, -38.0f), -90.0f, shelfArmAngle * 0.8f, conveyorTex, wallTex);
+    // 4b. SHELF PLACEMENT ARMS — 10 Cartesian Stacker Cranes
+    for(int i=0; i<10; i++) {
+        drawShelfArm(shader, shelfArms[i].basePos, shelfArms[i].effectorPos, conveyorTex, wallTex);
+    }
 
     // 5. DRAW MASSIVE WAREHOUSE ROOM (Floor, Concrete Pillars, Ceiling)
     glBindTexture(GL_TEXTURE_2D, floorTex);
